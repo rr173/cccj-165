@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from . import data as demo_data
+from . import groupdata
+from .dataset import GroupStore, create_group
 from .encoding import Schema
+from .grouprecon import reconcile_and_publish
+from .mirror import Mirror
 from .oracle import compare_inputs
 from .runner import run_session
 from .store import SnapshotStore, create_snapshot
@@ -445,6 +449,125 @@ def command_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_group(args: argparse.Namespace) -> int:
+    """Relational dataset reconciliation demo: two groups, one mirror."""
+
+    workdir = Path(args.workdir)
+    if workdir.exists() and args.fresh:
+        shutil.rmtree(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    schemas = groupdata.group_schemas()
+    manifest = groupdata.group_manifest()
+    left_tables = groupdata.base_group(args.customers, args.orders, args.links, seed=args.seed)
+    right_tables, intended = groupdata.variant_group(left_tables, seed=args.seed)
+
+    left_dir = workdir / "left-group"
+    right_dir = workdir / "right-group"
+    t0 = time.time()
+    left_group_id = create_group(
+        left_dir,
+        groupdata.DATASET_ID,
+        groupdata.BATCH_LEFT,
+        {name: (schemas[name], left_tables[name]) for name in schemas},
+        manifest,
+    )
+    right_group_id = create_group(
+        right_dir,
+        groupdata.DATASET_ID,
+        groupdata.BATCH_RIGHT,
+        {name: (schemas[name], right_tables[name]) for name in schemas},
+        manifest,
+    )
+    with GroupStore.open(left_dir) as source:
+        mirror = Mirror.initialize(workdir / "mirror", source)
+    build_seconds = time.time() - t0
+
+    params = SummaryParams(
+        position_bits=args.position_bits,
+        max_gen=args.max_gen,
+        leaf_limit=args.leaf_limit,
+        cord_max_bytes=args.cord_max_bytes,
+        rows_per_chunk=args.rows_per_chunk,
+        max_nodes_per_query=args.max_nodes_per_query,
+    )
+    t1 = time.time()
+    result = reconcile_and_publish(
+        left_dir,
+        right_dir,
+        mirror.path,
+        params=params,
+        scratch_dir=workdir / "scratch",
+        session_prefix="group-demo",
+    )
+    reconcile_seconds = time.time() - t1
+
+    # Independent expectations: per-table row-by-row oracle over the inputs.
+    expected = {
+        name: compare_inputs(left_tables[name], right_tables[name], schemas[name].field_names())
+        for name in sorted(schemas)
+    }
+    per_table = {}
+    full_canonical = 0
+    for name in sorted(schemas):
+        report = result.tables[name]
+        canonical_left = sum(
+            len(r) for r in _canonical_records(schemas[name], left_tables[name])
+        )
+        canonical_right = sum(
+            len(r) for r in _canonical_records(schemas[name], right_tables[name])
+        )
+        full_canonical += canonical_right
+        per_table[name] = {
+            "input_rows": {"left": report.left_rows, "right": report.right_rows},
+            "output_rows": (
+                result.publish.staged_rows.get(name)
+                if result.publish and result.publish.staged_rows
+                else None
+            ),
+            "differences": report.counts(),
+            "expected_differences": expected[name].counts(),
+            "differences_match_oracle": report.counts() == expected[name].counts(),
+            "wire_bytes": report.wire_bytes,
+            "canonical_bytes_left": canonical_left,
+            "canonical_bytes_right": canonical_right,
+            "fallback_regions": report.fallback_regions,
+        }
+    payload = {
+        "dataset_id": result.dataset_id,
+        "left_batch": result.left_batch,
+        "right_batch": result.right_batch,
+        "manifest_version": result.manifest_version,
+        "left_group_id": left_group_id,
+        "right_group_id": right_group_id,
+        "group_result_id": result.result_id,
+        "complete": result.complete,
+        "reason": result.reason,
+        "tables": per_table,
+        "intended_changes": intended,
+        "wire_bytes_total": result.wire_bytes,
+        "sent_bytes": result.sent_bytes,
+        "received_bytes": result.received_bytes,
+        "full_right_group_canonical_bytes": full_canonical,
+        "wire_vs_full_group": (
+            round(result.wire_bytes / full_canonical, 4) if full_canonical else None
+        ),
+        "mirror_generation_before": result.generation_before,
+        "mirror_generation_after": result.generation_after,
+        "publish": result.publish.to_dict() if result.publish else None,
+        "build_seconds": round(build_seconds, 3),
+        "reconcile_seconds": round(reconcile_seconds, 3),
+    }
+    json.dump(payload, open(workdir / "group_report.json", "w"), indent=2, sort_keys=True)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if result.complete else 1
+
+
+def _canonical_records(schema, rows):
+    from .encoding import encode_record
+
+    return [encode_record(schema, row_id, values) for row_id, values in rows]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="recon")
     parser.add_argument("--workdir", default="/tmp/recon-demo")
@@ -468,6 +591,19 @@ def main(argv: list[str] | None = None) -> int:
 
     bench = sub.add_parser("benchmark")
     bench.set_defaults(func=command_benchmark)
+
+    group = sub.add_parser("group")
+    group.add_argument("--customers", type=int, default=400)
+    group.add_argument("--orders", type=int, default=1200)
+    group.add_argument("--links", type=int, default=64)
+    group.add_argument("--seed", type=int, default=7)
+    group.add_argument("--leaf-limit", type=int, default=64)
+    group.add_argument("--cord-max-bytes", type=int, default=1 << 16)
+    group.add_argument("--rows-per-chunk", type=int, default=4096)
+    group.add_argument("--max-nodes-per-query", type=int, default=512)
+    group.add_argument("--position-bits", type=int, default=64)
+    group.add_argument("--max-gen", type=int, default=None)
+    group.set_defaults(func=command_group)
     args = parser.parse_args(argv)
     return args.func(args)
 

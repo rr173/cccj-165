@@ -70,7 +70,33 @@ CREATE TABLE IF NOT EXISTS messages (
     request_key TEXT NOT NULL UNIQUE,
     payload BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dataset_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    dataset_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    table_name TEXT NOT NULL
+);
 """
+
+
+@dataclass(frozen=True)
+class DatasetTag:
+    """The relational-dataset label carried inside a table snapshot file.
+
+    A table file that belongs to a dataset group stores its stable dataset
+    id, its collection batch id, and its table name in ``dataset_meta``.  The
+    tag is metadata only: it never enters the per-table content commitment,
+    so group and non-group snapshots commit identically for equal content.
+    """
+
+    dataset_id: str
+    batch_id: str
+    table_name: str
+
+    def __post_init__(self) -> None:
+        for value in (self.dataset_id, self.batch_id, self.table_name):
+            if not isinstance(value, str) or not value:
+                raise SnapshotError("dataset tag fields must be non-empty strings")
 
 
 @dataclass(frozen=True)
@@ -112,13 +138,16 @@ def create_snapshot(
     *,
     created_from: str,
     params: Mapping[str, object] | None = None,
+    dataset: DatasetTag | None = None,
 ) -> SnapshotIdentity:
     """Write a brand-new immutable snapshot.
 
     The target file must not already exist.  Every row is validated against the
     schema, encoded canonically, and de-duplicated by row id before anything is
     written.  The commitment is computed from exactly the bytes that are
-    stored.
+    stored.  When ``dataset`` is given, the file additionally carries the
+    dataset/batch/table tag of its relational group (metadata only; it never
+    enters the content commitment).
     """
 
     target = Path(path)
@@ -178,6 +207,12 @@ def create_snapshot(
                     created_from,
                 ),
             )
+            if dataset is not None:
+                conn.execute(
+                    "INSERT INTO dataset_meta(id, dataset_id, batch_id, table_name) "
+                    "VALUES (1, ?, ?, ?)",
+                    (dataset.dataset_id, dataset.batch_id, dataset.table_name),
+                )
     finally:
         conn.close()
 
@@ -356,6 +391,19 @@ class SnapshotStore:
 
     def __len__(self) -> int:
         return self.identity.row_count
+
+    def dataset_tag(self) -> DatasetTag | None:
+        """The dataset/batch/table tag of a group table file, if present."""
+
+        try:
+            row = self._conn.execute(
+                "SELECT dataset_id, batch_id, table_name FROM dataset_meta WHERE id = 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None  # snapshot predates the dataset_meta table
+        if row is None:
+            return None
+        return DatasetTag(str(row[0]), str(row[1]), str(row[2]))
 
     def close(self) -> None:
         self._conn.close()

@@ -6,8 +6,10 @@
 本仓库包含：
 
 * 可运行的协议实现（`recon/`）；
+* **关系数据集对账**：多张互相关联的表组成的数据集组对账 + 本地镜像原子发布
+  （`recon/dataset.py`、`recon/grouprecon.py`、`recon/mirror.py`，见第 6 节）；
 * 两端**各自独立的操作系统进程**演练（`recon/twoprocess.py`、`recon/worker.py`）；
-* 独立测试套件（`tests/`，50 个测试，纯标准库运行，无需 pytest）；
+* 独立测试套件（`tests/`，66 个测试，纯标准库运行，无需 pytest）；
 * 独立于协议实现的逐行比对 oracle（`recon/oracle.py`）。
 
 ---
@@ -23,6 +25,9 @@ python3 -m recon.cli --workdir /tmp/recon-demo --fresh demo --rows 100000 --prof
 
 # 进程内演练（同样的引擎，便于快速观察）
 python3 -m recon.cli --workdir /tmp/recon-demo --fresh demo --rows 100000 --mode threads
+
+# 关系数据集对账：两端各 4 张关联表，对账 + 镜像原子发布
+python3 -m recon.cli --workdir /tmp/recon-group --fresh group --customers 2000 --orders 8000
 
 # 复现 README 中的全部基准（含密集差异 + 极小摘要预算）
 python3 -m recon.cli --workdir /tmp/recon-bench --fresh benchmark
@@ -277,12 +282,87 @@ applied_commit == peer 快照承诺
 
 ---
 
-## 6. 代码结构
+## 6. 关系数据集对账（多表组）
+
+实际交接的数据常由多张互相关联的表组成。`recon/dataset.py`、`recon/grouprecon.py`、
+`recon/mirror.py` 在单表协议之上提供**关系数据集对账**：两端各自提交一组表快照和关系
+清单，工具复用现有的紧凑摘要、明细核验和局部回退逐表定位差异，并把对端状态构建为本地
+镜像的新代次。已有单表命令（`demo` / `benchmark`）不受影响。
+
+### 6.1 数据集组
+
+一个数据集组是一个目录：
+
+```
+group.json              # format、数据集标识、采集批次标识、关系清单、表名列表
+tables/<表名>.sqlite     # 每张表一个不可变快照（现有单表格式）
+```
+
+* 每张表文件内部带 `dataset_meta`（数据集标识 + 批次标识 + 表名）；该标签只是元数据，
+  不进入表级内容承诺。打开组时逐表重算承诺，并要求组内所有表文件的批次标识一致——
+  **不同批次拼不成一个有效组**。
+* 记录身份 = 表名 + row_id；row_id 只在表内唯一。每张表的列类型、空值规则、规范编码、
+  内容承诺与单表协议完全相同。
+* 关系清单（带显式版本号）声明外键 `子表.列 -> 父表.row_id`：引用列必须是 text
+  （row_id 的类型），可空外键允许 NULL；清单的内容哈希进入组身份。
+* **组身份**绑定：数据集标识、批次标识、清单哈希、每个表名及其 schema 与内容承诺。
+* 两端兼容性：数据集标识、表名集合、各表 schema、关系清单必须一致；缺表、类型变化、
+  清单不同、数据集不同都是显式错误（`GroupCompatibilityError`），绝不静默拼合。
+  两端**批次可以不同**（旧批次对新批次正是常态），两个批次身份都记录在结果里。
+
+### 6.2 对账与整体结果
+
+`reconcile_group(left_dir, right_dir)` 对每张表运行一次现有单表会话（同一引擎、同样的
+摘要/明细/回退能力），逐表产出 `only_left` / `only_right` / `changed` 明细（规范字节、
+按 row_id 排序），并给出绑定两端完整数据集身份的组级结果标识 `result_id`（由两端组身份、
+各表承诺与逐表差异计数计算）。任何一张表未完成，整体结果即为未完成。
+
+### 6.3 镜像与原子发布
+
+`reconcile_and_publish(left_dir, right_dir, mirror_dir)` 把对端状态发布到本地镜像：
+
+```
+mirror/
+  CURRENT                 # 当前代次指针（原子 rename 切换）
+  generations/000001/     # 一个完整数据集组 + publish.json（发布清单）
+  generations/000002/ ...
+```
+
+1. 在隔离的暂存目录中构建整组新代次（每张表 = 本地内容应用对端差异后的重建结果）。
+2. 逐表校验：重建内容承诺 == 对端对应表承诺；再从暂存文件重新打开、重算承诺，
+   要求整组身份 == 对端组身份。
+3. 对**最终整组状态**做外键检查：同批新增的父行、同批删除的父子行、改指向另一父行的
+   子行、可空关系形成的循环引用都按最终状态判定；中途暂时缺少目标不会误拒，最终状态里
+   的悬空引用也不会被跳过。
+4. 全部通过才把代次目录就位并原子切换 `CURRENT`；任何失败（表未完成、外键无目标、
+   身份或承诺不符）都会清理暂存目录，旧代次仍是当前代次且内容不变，读者照常读取。
+5. 发布清单 `publish.json` 记录：批次标识、各表承诺、关系清单版本与哈希、发布代次、
+   上一代次、来源组身份与本次 `result_id`——可复核本次到底发布了哪组数据。
+
+原始输入快照始终保持只读（文件权限 `0444`，协议进程以 `mode=ro` 打开；应答缓存写在工作
+目录的 sidecar 文件中）。
+
+### 6.4 运行与验证
+
+```bash
+python3 -m recon.cli --workdir /tmp/recon-group --fresh group --customers 2000 --orders 8000
+```
+
+输出（同时写入 `group_report.json`）：每表输入/输出行数、逐表差异（与独立逐行 oracle
+对照）、每表与总计传输字节、全组 canonical 字节对照、组级结果身份、发布前后镜像代次、
+发布清单。演示数据在同一批次里同时包含：新增父行+引用它的新增子行、同批删除父子行、
+改值、子行改指向另一父行、可空循环引用变化。实测（2000 客户 / 8000 订单 / 128 对循环
+节点，10 条差异）：传输 218 808 字节，约为右端全组 canonical 字节（619 939）的 35%，
+镜像从代次 1 原子发布到代次 2。
+
+---
+
+## 7. 代码结构
 
 ```
 recon/
   encoding.py      schema 声明、规范编码/解码、内容承诺、域分离哈希
-  store.py         不可变只读 SQLite 快照、打开时重算承诺、应答缓存 sidecar
+  store.py         不可变只读 SQLite 快照、打开时重算承诺、应答缓存 sidecar、数据集标签
   summary.py       位置/节点/区间、聚合摘要、cord、proof、本地索引、协商参数
   wire.py          帧编解码、信封校验、会话上下文、请求缓存键、协商逻辑
   initiator.py     发起方：握手、分层定位、probe/fallback、应用与承诺核验
@@ -292,7 +372,11 @@ recon/
   twoprocess.py    双进程演练：纯字节中继 + 重复投递故障注入 + 精确字节统计
   oracle.py        独立逐行比对，生成期望差集
   data.py          确定性数据生成（与协议无关）
-  cli.py           demo / benchmark 命令行
+  dataset.py       数据集组：关系清单、组身份、兼容性检查、最终状态外键扫描
+  grouprecon.py    组对账引擎：逐表会话、组级结果身份、重建与发布编排
+  mirror.py        代次镜像：隔离暂存、逐表承诺核验、外键终态检查、原子发布
+  groupdata.py     确定性演示数据组生成（与协议无关）
+  cli.py           demo / benchmark / group 命令行
 tests/
   run_tests.py     无第三方依赖的测试运行器
   support.py       独立应用差集、承诺计算等测试辅助
@@ -303,11 +387,12 @@ tests/
   test_scale.py        10 万行确切字节 + 全表应用核验、密集回退（3）
   test_ordering.py     乱序/重复应答归属、信封完整性（2）
   test_collisions.py   桶拥挤与真实哈希碰撞（3）
+  test_group.py        数据集组对账、外键终态、发布失败与旧镜像完整性（16）
 ```
 
-合计 **50 个测试**，全部通过（`python3 tests/run_tests.py`）。
+合计 **66 个测试**，全部通过（`python3 tests/run_tests.py`）。
 
-## 7. 安全与工程边界（明确不做的事）
+## 8. 安全与工程边界（明确不做的事）
 
 * 不做节点认证、不做签名；身份仅靠快照 id/承诺绑定，且只在本会话内有效。
 * 不做文件分片交付：明细传输是协议内分页（`probe` / `fallback`），不是文件级分片。
