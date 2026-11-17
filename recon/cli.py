@@ -15,9 +15,11 @@ from typing import Any
 
 from . import data as demo_data
 from . import groupdata
+from . import migratedata
 from .dataset import GroupStore, create_group
 from .encoding import Schema
 from .grouprecon import reconcile_and_publish
+from .migrate import reconcile_migrated_and_publish
 from .mirror import Mirror
 from .oracle import compare_inputs
 from .runner import run_session
@@ -562,6 +564,150 @@ def command_group(args: argparse.Namespace) -> int:
     return 0 if result.complete else 1
 
 
+def command_migrate(args: argparse.Namespace) -> int:
+    """Schema-migration demo: two ends at different versions, one catalog."""
+
+    workdir = Path(args.workdir)
+    if workdir.exists() and args.fresh:
+        shutil.rmtree(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    catalog = migratedata.demo_catalog()
+    versions = migratedata.version_defs()
+    catalog_path = workdir / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(catalog.to_wire(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    left_rows = migratedata.left_rows_v1(args.customers, args.orders, seed=args.seed)
+    right_rows = migratedata.right_rows_v2(left_rows, seed=args.seed)
+    left_dir = workdir / "left-group-v1"
+    right_dir = workdir / "right-group-v2"
+    t0 = time.time()
+    left_group_id = create_group(
+        left_dir,
+        migratedata.DATASET_ID,
+        migratedata.BATCH_LEFT,
+        {name: (versions["v1"].tables[name], left_rows[name]) for name in left_rows},
+        versions["v1"].manifest,
+        schema_version="v1",
+    )
+    right_group_id = create_group(
+        right_dir,
+        migratedata.DATASET_ID,
+        migratedata.BATCH_RIGHT,
+        {name: (versions["v2"].tables[name], right_rows[name]) for name in right_rows},
+        versions["v2"].manifest,
+        schema_version="v2",
+    )
+    build_seconds = time.time() - t0
+
+    params = SummaryParams(
+        position_bits=args.position_bits,
+        max_gen=args.max_gen,
+        leaf_limit=args.leaf_limit,
+        cord_max_bytes=args.cord_max_bytes,
+        rows_per_chunk=args.rows_per_chunk,
+        max_nodes_per_query=args.max_nodes_per_query,
+    )
+    t1 = time.time()
+    result = reconcile_migrated_and_publish(
+        left_dir,
+        right_dir,
+        catalog=catalog,
+        target_version="v3",
+        mirror_dir=workdir / "mirror",
+        initialise_mirror=True,
+        work_dir=workdir / "migration-work",
+        keep_temp=True,
+        params=params,
+        session_prefix="migrate-demo",
+    )
+    run_seconds = time.time() - t1
+
+    # Independent expectations: decode the migrated groups (kept in the work
+    # dir) and compare the reconciliation's per-table differences against the
+    # row-by-row oracle over that migrated content.
+    per_table = {}
+    if result.left is not None and result.right is not None and result.reconcile is not None:
+        migrated_rows: dict[str, dict[str, dict[str, Any]]] = {}
+        for side, mig in (("left", result.left), ("right", result.right)):
+            with GroupStore.open(mig.migrated_dir) as group:
+                migrated_rows[side] = {
+                    name: _decode_rows(store) for name, store in group.tables.items()
+                }
+        for name in sorted(result.reconcile.tables):
+            report = result.reconcile.tables[name]
+            expected = compare_inputs(
+                sorted(migrated_rows["left"][name].items()),
+                sorted(migrated_rows["right"][name].items()),
+                versions["v3"].tables[name].field_names(),
+            )
+            per_table[name] = {
+                "input_rows": {"left": report.left_rows, "right": report.right_rows},
+                "differences": report.counts(),
+                "expected_differences": expected.counts(),
+                "differences_match_oracle": report.counts() == expected.counts(),
+                "wire_bytes": report.wire_bytes,
+                "fallback_regions": report.fallback_regions,
+            }
+
+    payload = {
+        "dataset_id": result.dataset_id,
+        "target_version": result.target_version,
+        "catalog_id": result.catalog_id,
+        "left_group_id": left_group_id,
+        "right_group_id": right_group_id,
+        "complete": result.complete,
+        "stage": result.stage,
+        "reason": result.reason,
+        "paths": {
+            "left": result.left.plan.path_versions if result.left else None,
+            "right": result.right.plan.path_versions if result.right else None,
+        },
+        "transform_ids": {
+            "left": result.left.plan.transform_id if result.left else None,
+            "right": result.right.plan.transform_id if result.right else None,
+        },
+        "migrated_group_ids": {
+            "left": result.left.migrated_group_id if result.left else None,
+            "right": result.right.migrated_group_id if result.right else None,
+        },
+        "step_stats": {
+            "left": [s.to_dict() for s in result.left.steps] if result.left else None,
+            "right": [s.to_dict() for s in result.right.steps] if result.right else None,
+        },
+        "tables": per_table,
+        "group_result_id": result.reconcile.result_id if result.reconcile else None,
+        "wire_bytes_total": result.reconcile.wire_bytes if result.reconcile else None,
+        "mirror_generation_before": result.generation_before,
+        "mirror_generation_after": result.generation_after,
+        "publish": (
+            result.reconcile.publish.to_dict()
+            if result.reconcile and result.reconcile.publish
+            else None
+        ),
+        "error": result.error,
+        "build_seconds": round(build_seconds, 3),
+        "run_seconds": round(run_seconds, 3),
+    }
+    json.dump(payload, open(workdir / "migration_report.json", "w"), indent=2, sort_keys=True)
+    if not args.keep_work:
+        shutil.rmtree(workdir / "migration-work", ignore_errors=True)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0 if result.complete else 1
+
+
+def _decode_rows(store) -> dict[str, dict[str, Any]]:
+    from .encoding import decode_record
+
+    rows: dict[str, dict[str, Any]] = {}
+    for record in store.iter_records():
+        row_id, values = decode_record(store.schema, record)
+        rows[row_id] = values
+    return rows
+
+
 def _canonical_records(schema, rows):
     from .encoding import encode_record
 
@@ -604,6 +750,20 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--position-bits", type=int, default=64)
     group.add_argument("--max-gen", type=int, default=None)
     group.set_defaults(func=command_group)
+
+    mig = sub.add_parser("migrate")
+    mig.add_argument("--customers", type=int, default=400)
+    mig.add_argument("--orders", type=int, default=1200)
+    mig.add_argument("--seed", type=int, default=11)
+    mig.add_argument("--leaf-limit", type=int, default=64)
+    mig.add_argument("--cord-max-bytes", type=int, default=1 << 16)
+    mig.add_argument("--rows-per-chunk", type=int, default=4096)
+    mig.add_argument("--max-nodes-per-query", type=int, default=512)
+    mig.add_argument("--position-bits", type=int, default=64)
+    mig.add_argument("--max-gen", type=int, default=None)
+    mig.add_argument("--keep-work", action="store_true",
+                     help="keep the temporary migrated groups for inspection")
+    mig.set_defaults(func=command_migrate)
     args = parser.parse_args(argv)
     return args.func(args)
 

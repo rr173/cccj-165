@@ -83,14 +83,23 @@ def _flip_current(root: Path, generation: int) -> None:
     os.replace(tmp, root / "CURRENT")
 
 
-def _group_json(dataset_id: str, batch_id: str, manifest, tables: list[str]) -> dict:
-    return {
+def _group_json(
+    dataset_id: str,
+    batch_id: str,
+    manifest,
+    tables: list[str],
+    schema_version: str | None = None,
+) -> dict:
+    doc = {
         "format": GROUP_FORMAT,
         "dataset_id": dataset_id,
         "batch_id": batch_id,
         "manifest": manifest.to_wire(),
         "tables": tables,
     }
+    if schema_version is not None:
+        doc["schema_version"] = schema_version
+    return doc
 
 
 class Mirror:
@@ -152,6 +161,7 @@ class Mirror:
                     "format": PUBLISH_FORMAT,
                     "dataset_id": source.dataset_id,
                     "batch_id": source.batch_id,
+                    "schema_version": source.schema_version,
                     "manifest_version": source.manifest.version,
                     "manifest_hash": source.manifest.content_hash().hex(),
                     "generation": 1,
@@ -243,6 +253,7 @@ class Mirror:
                     expectation.batch_id,
                     expectation.manifest,
                     sorted(expected_tables),
+                    expectation.schema_version,
                 ),
             )
 
@@ -275,6 +286,7 @@ class Mirror:
                 "format": PUBLISH_FORMAT,
                 "dataset_id": expectation.dataset_id,
                 "batch_id": expectation.batch_id,
+                "schema_version": expectation.schema_version,
                 "manifest_version": expectation.manifest.version,
                 "manifest_hash": expectation.manifest.content_hash().hex(),
                 "generation": new_generation,
@@ -326,7 +338,13 @@ def _copy_group_content(source: GroupStore, staging: Path) -> None:
         os.chmod(target, 0o444)
     _write_json(
         staging / "group.json",
-        _group_json(source.dataset_id, source.batch_id, source.manifest, sorted(source.tables)),
+        _group_json(
+            source.dataset_id,
+            source.batch_id,
+            source.manifest,
+            sorted(source.tables),
+            source.schema_version,
+        ),
     )
 
 

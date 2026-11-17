@@ -8,8 +8,10 @@
 * 可运行的协议实现（`recon/`）；
 * **关系数据集对账**：多张互相关联的表组成的数据集组对账 + 本地镜像原子发布
   （`recon/dataset.py`、`recon/grouprecon.py`、`recon/mirror.py`，见第 6 节）；
+* **按显式 schema 迁移目录对账**：两端 schema 版本不同时，先把各自数据转换到指定
+  目标版本，再复用既有组对账与镜像发布（`recon/migrate.py`，见第 7 节）；
 * 两端**各自独立的操作系统进程**演练（`recon/twoprocess.py`、`recon/worker.py`）；
-* 独立测试套件（`tests/`，66 个测试，纯标准库运行，无需 pytest）；
+* 独立测试套件（`tests/`，100 个测试，纯标准库运行，无需 pytest）；
 * 独立于协议实现的逐行比对 oracle（`recon/oracle.py`）。
 
 ---
@@ -28,6 +30,9 @@ python3 -m recon.cli --workdir /tmp/recon-demo --fresh demo --rows 100000 --mode
 
 # 关系数据集对账：两端各 4 张关联表，对账 + 镜像原子发布
 python3 -m recon.cli --workdir /tmp/recon-group --fresh group --customers 2000 --orders 8000
+
+# schema 迁移对账：左端 v1、右端 v2，按目录迁移到 v3 后对账并发布镜像
+python3 -m recon.cli --workdir /tmp/recon-migrate --fresh migrate --customers 2000 --orders 8000
 
 # 复现 README 中的全部基准（含密集差异 + 极小摘要预算）
 python3 -m recon.cli --workdir /tmp/recon-bench --fresh benchmark
@@ -357,7 +362,100 @@ python3 -m recon.cli --workdir /tmp/recon-group --fresh group --customers 2000 -
 
 ---
 
-## 7. 代码结构
+## 7. 按显式 schema 迁移目录对账（跨版本）
+
+两个站点升级节奏不同：一端仍产出旧字段，另一端已改名、增列或调整枚举值。第 6 节的
+组对账要求两边表结构完全兼容；`recon/migrate.py` 在其上增加**按显式迁移目录对账**：
+两端各自声明数据集 schema 版本，工具按目录把两端数据转换到用户指定的目标版本，
+再复用既有紧凑摘要对账与镜像原子发布。
+
+### 7.1 版本声明与迁移目录
+
+* 数据集组的 `group.json` 可声明 `schema_version`（元数据标签，不进入组身份；
+  目录会按实际表结构校验该标签，谎报即计划错误）。
+* **迁移目录**（JSON，`recon-migration-catalog-v1`）声明：
+  * `versions`：每个版本的全部表 schema（字段名/类型/可空性）及该版本生效的
+    **关系清单**；
+  * `steps`：有向版本步骤 `from -> to`，每步为数据集的**每张表**声明字段规则——
+    目标字段的来源字段（保留/改名）、新增字段的**显式常量默认值**、文本枚举的
+    **显式一对一改写**、`int64` 与十进制文本之间的**严格转换**。不再进入目标
+    schema 的源字段即被删除。每一步的目标 schema 与生效清单即其目标版本的声明。
+* 目录身份 `catalog_id` 是全部声明（版本、规则、清单）规范化后的内容哈希；
+  同一目录内容必得同一身份。
+
+### 7.2 计划：先验证，后转换
+
+`plan_migrations()` 在**读取并转换任何数据之前**完成全部结构校验，出错即抛出
+`MigrationPlanError`（带稳定 `code` 与可定位 `context`：版本/步骤/表/字段）：
+
+* 目录必须**无环**（`catalog_cycle`），步骤端点必须是已声明版本，同一 `(from,to)`
+  不得重复，每步必须**完整覆盖**数据集全部表（`table_coverage`）；
+  每个版本的清单必须能映射到该版本的表结构（`manifest_unmappable`）。
+* 字段映射必须完整且无歧义：目标字段重复（`field_mapping_duplicate`）、缺失
+  （`field_mapping_missing`）、映射到目标 schema 之外的字段（`field_mapping_unknown`）、
+  来源字段不存在（`source_field_unknown`）、来源与默认值同时出现
+  （`source_and_default`）、对已有字段给常量默认（`default_on_existing_field`）。
+  类型变化必须显式声明转换（`type_change_without_conversion`），转换的端点类型必须
+  匹配（`conversion_type_mismatch`），枚举只能用于文本且映射必须一对一
+  （`enum_on_non_text` / `enum_not_one_to_one`），默认值必须符合目标类型与可空性
+  （`invalid_default`）。
+* 输入组的版本标签必须存在于目录（`unknown_source_version` /
+  `unknown_target_version` / `schema_version_missing`），组的实际表结构与清单必须
+  与目录对该版本的声明一致（`version_schema_mismatch` /
+  `version_manifest_mismatch`），数据集标识必须一致（`dataset_mismatch`）。
+* 从各自版本到目标版本的路径必须**存在且唯一**：没有路径（`no_path`）或有多条
+  （`ambiguous_path`）都是计划错误，工具**绝不自行挑一条路线继续**。一端已在目标
+  版本时路径为空（零步），属合法。
+
+### 7.3 转换：确定、严格、可定位
+
+* 只覆盖实际迁移常见操作：保留/改名、带显式常量默认值的新增、删除、文本枚举一对一
+  改写、`int64` <-> 十进制文本严格转换（可选 `-` 号 + 数字；越界即错；`int64` 到文本
+  为规范十进制）。
+* 转换确定且保留 `row_id`；**禁止**舍入、截断、隐式布尔/整数互转、静默吞掉 null
+  （null 仅在目标可空时原样保留并计数）、把非法值改成默认值。每一步都按声明的输入
+  类型（解码）与输出类型（重编码）验证。
+* 对越界 int64（`int64_out_of_range`）、格式不符的十进制文本（`bad_decimal_format`）、
+  未列出的枚举值（`enum_unmapped`）、null 违反非空约束（`null_violation`），
+  抛出 `MigrationConversionError`，逐项报告**版本步骤、表、row_id、字段、错误类别**
+  （同一步骤内跨表收集），绝不输出看似成功的差异结果。
+* 原始快照始终保持只读；迁移结果写入**隔离的临时数据集组**，批次标签由来源批次、
+  步骤目标版本与目录身份确定性派生。同一来源版本、目标版本与目录内容必得到相同的
+  **转换身份**（`transform_id`，绑定目录身份与版本路径），迁移结果组身份也随之确定。
+* 逐步迁移完成后，两端必须具有相同的目标表集合、schema 与关系清单（显式兼容性
+  检查），才进入第 6 节的既有组对账；外键列改名或转换后，按**目标关系定义**对最终
+  整组状态做外键检查（在镜像发布的暂存终态上，与既有行为一致），而不是在逐表转换的
+  中间状态检查。
+* 镜像仍须等全部表对账、内容承诺与外键检查通过后才整体发布。计划错误、任一行转换
+  失败、对账未完成或最终关系无效时，不发布新代次，旧镜像保持可读且不变；临时数据
+  清理后可修正目录重试。
+
+### 7.4 转换报告
+
+`MigrationRunResult` 绑定：两端**原始组身份**与批次、目标版本、**目录身份**、
+实际**版本路径**与每端**转换身份**；按版本步骤和表列出输入/输出行数与逐字段转换
+计数（copied/converted/mapped/defaulted/nulls）及失败位置；完成时关联既有组级对账
+结果（`result_id`、逐表差异、传输字节）与镜像代次。测试不依赖产品自报计数：
+独立参考逻辑从原始输入计算目标行并独立扫描外键，逐行比对转换结果与最终镜像。
+
+### 7.5 运行
+
+```bash
+python3 -m recon.cli --workdir /tmp/recon-migrate --fresh migrate --customers 2000 --orders 8000
+```
+
+演示目录含三个版本：v1（`tier` 为文本、`amount_text`、`state` 枚举码、`legacy_note`）、
+v2（`tier` 转 int64、`amount_text` 改名并转为 `amount_cents`、删除 `legacy_note`、
+新增常量默认列 `channel`）、v3（`name` 改名 `full_name`、`tier` 转回文本 `tier_code`、
+新增默认列 `segment`、外键列 `customer_id` 改名 `cust_id` 且清单跟随、`state` 枚举
+改写为 `status`）。左端为 v1（路径 v1→v2→v3），右端为 v2（路径 v2→v3）。输出
+（`migration_report.json`）含两端路径与转换身份、逐步逐表统计、逐表差异（与独立
+oracle 对照）、组级结果身份与发布代次。实测（400 客户 / 1200 订单）：迁移后逐表
+差异与独立参考完全一致，镜像从代次 1 原子发布到代次 2。
+
+---
+
+## 8. 代码结构
 
 ```
 recon/
@@ -376,7 +474,9 @@ recon/
   grouprecon.py    组对账引擎：逐表会话、组级结果身份、重建与发布编排
   mirror.py        代次镜像：隔离暂存、逐表承诺核验、外键终态检查、原子发布
   groupdata.py     确定性演示数据组生成（与协议无关）
-  cli.py           demo / benchmark / group 命令行
+  migrate.py       迁移目录、计划器（唯一无环路径）、严格转换执行、迁移编排与报告
+  migratedata.py   确定性跨版本演示数据与目录生成（与协议无关）
+  cli.py           demo / benchmark / group / migrate 命令行
 tests/
   run_tests.py     无第三方依赖的测试运行器
   support.py       独立应用差集、承诺计算等测试辅助
@@ -388,11 +488,12 @@ tests/
   test_ordering.py     乱序/重复应答归属、信封完整性（2）
   test_collisions.py   桶拥挤与真实哈希碰撞（3）
   test_group.py        数据集组对账、外键终态、发布失败与旧镜像完整性（16）
+  test_migration.py    迁移目录/计划错误/严格转换/跨版本对账发布与重试（34）
 ```
 
-合计 **66 个测试**，全部通过（`python3 tests/run_tests.py`）。
+合计 **100 个测试**，全部通过（`python3 tests/run_tests.py`）。
 
-## 8. 安全与工程边界（明确不做的事）
+## 9. 安全与工程边界（明确不做的事）
 
 * 不做节点认证、不做签名；身份仅靠快照 id/承诺绑定，且只在本会话内有效。
 * 不做文件分片交付：明细传输是协议内分页（`probe` / `fallback`），不是文件级分片。
@@ -401,3 +502,7 @@ tests/
 * 摘要参数（`position_bits`、`max_gen`、`leaf_limit`、`cord_max_bytes`、
   `rows_per_chunk`、`max_nodes_per_query`、`max_key_splits`）都是**会话配置**，
   由发起方给定、应答方原样采用，并纳入每条消息的 `negotiated`；绝不由数据或已知差异推导。
+* 迁移目录只做**声明式**字段级操作（保留/改名、常量默认新增、删除、枚举一对一改写、
+  int64↔十进制文本严格转换）：不做表的增删（同一目录内所有版本表集合必须一致）、
+  不做未声明的类型转换、不做行级过滤或连接、不在多条迁移路径间自动选择。
+  目录未覆盖的语义（如跨表计算列）不属于本工具。

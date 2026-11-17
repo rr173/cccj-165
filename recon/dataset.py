@@ -208,12 +208,14 @@ class GroupStore:
         batch_id: str,
         manifest: RelationManifest,
         tables: dict[str, SnapshotStore],
+        schema_version: str | None = None,
     ) -> None:
         self.path = Path(path)
         self.dataset_id = dataset_id
         self.batch_id = batch_id
         self.manifest = manifest
         self._tables = tables
+        self.schema_version = schema_version
         self.group_id = compute_group_id(dataset_id, batch_id, manifest, tables)
 
     @staticmethod
@@ -234,6 +236,13 @@ class GroupStore:
             raise GroupError("group_format", "dataset_id must be a non-empty string")
         if not isinstance(batch_id, str) or not batch_id:
             raise GroupError("group_format", "batch_id must be a non-empty string")
+        schema_version = meta.get("schema_version")
+        if schema_version is not None and (
+            not isinstance(schema_version, str) or not schema_version
+        ):
+            raise GroupError(
+                "group_format", "schema_version must be a non-empty string when present"
+            )
         manifest = RelationManifest.from_wire(meta.get("manifest"))
         names = meta.get("tables")
         if (
@@ -286,7 +295,7 @@ class GroupStore:
             for store in stores.values():
                 store.close()
             raise
-        return GroupStore(root, dataset_id, batch_id, manifest, stores)
+        return GroupStore(root, dataset_id, batch_id, manifest, stores, schema_version)
 
     @property
     def tables(self) -> dict[str, SnapshotStore]:
@@ -309,18 +318,34 @@ class GroupStore:
 def _validate_manifest_against_schemas(
     manifest: RelationManifest, stores: Mapping[str, SnapshotStore]
 ) -> None:
+    validate_manifest_against_schema_map(
+        manifest, {name: store.schema for name, store in stores.items()}
+    )
+
+
+def validate_manifest_against_schema_map(
+    manifest: RelationManifest, schemas: Mapping[str, Schema]
+) -> None:
+    """Require every foreign key to reference a declared, compatible column.
+
+    This is the schema-map form of the group loader's manifest check, shared
+    with the migration catalog validator: foreign keys must point at tables
+    and columns that exist, a reference to a row id must be a text column,
+    and the declared nullability must match the column's.
+    """
+
     for fk in manifest.foreign_keys:
-        if fk.child_table not in stores:
+        if fk.child_table not in schemas:
             raise GroupError(
                 "manifest_unknown_table",
                 f"foreign key child table {fk.child_table!r} is not in the group",
             )
-        if fk.parent_table not in stores:
+        if fk.parent_table not in schemas:
             raise GroupError(
                 "manifest_unknown_table",
                 f"foreign key parent table {fk.parent_table!r} is not in the group",
             )
-        schema = stores[fk.child_table].schema
+        schema = schemas[fk.child_table]
         if fk.child_column not in schema.field_names():
             raise GroupError(
                 "manifest_unknown_column",
@@ -352,6 +377,8 @@ def create_group(
     batch_id: str,
     tables: Mapping[str, tuple[Schema, Iterable[tuple[str, Mapping[str, object]]]]],
     manifest: RelationManifest,
+    *,
+    schema_version: str | None = None,
 ) -> str:
     """Write a brand-new dataset group and return its group identity.
 
@@ -360,6 +387,11 @@ def create_group(
     (manifest sanity, batch consistency) happens when the group is *opened*;
     this writer deliberately only stamps what it is given, so tests can build
     deliberately broken groups and watch the loader reject them.
+
+    ``schema_version`` is an optional declarative label recorded in
+    ``group.json``; the migration planner validates it against the catalog's
+    declared structure for that version.  It is metadata only and never
+    enters the group identity (which already binds the actual schemas).
     """
 
     root = Path(path)
@@ -371,6 +403,12 @@ def create_group(
         raise GroupError("group_format", "dataset_id must be a non-empty string")
     if not isinstance(batch_id, str) or not batch_id:
         raise GroupError("group_format", "batch_id must be a non-empty string")
+    if schema_version is not None and (
+        not isinstance(schema_version, str) or not schema_version
+    ):
+        raise GroupError(
+            "group_format", "schema_version must be a non-empty string when given"
+        )
     names = sorted(tables)
     if not names:
         raise GroupError("group_format", "a group needs at least one table")
@@ -392,6 +430,8 @@ def create_group(
         "manifest": manifest.to_wire(),
         "tables": names,
     }
+    if schema_version is not None:
+        meta["schema_version"] = schema_version
     (root / "group.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -465,6 +505,7 @@ class GroupExpectation:
     schemas: Mapping[str, Schema]
     table_commitments: Mapping[str, bytes]
     group_id: str
+    schema_version: str | None = None
 
     @staticmethod
     def from_group(group: GroupStore) -> "GroupExpectation":
@@ -477,6 +518,7 @@ class GroupExpectation:
                 name: store.identity.commitment for name, store in group.tables.items()
             },
             group_id=group.group_id,
+            schema_version=group.schema_version,
         )
 
 
